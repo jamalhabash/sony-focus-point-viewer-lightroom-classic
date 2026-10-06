@@ -152,3 +152,68 @@ focuspoint render <FILE> --out-dir <DIR> [--source <JPEG>] [--size <PX>] [--crop
   `LrPathUtils.getStandardFilePath("temp")/focuspoint/`; clean old renders.
 * Non-Sony / no-focus photos: show a clear message, not an error dialog.
 * Log via `LrLogger` (`focuspoint`, logfile).
+
+## v0.2 — instant flipping (render cache + prefetch)
+
+Goal: flipping to a photo in the viewer shows its focus point with no
+perceptible delay, even when scrubbing quickly.
+
+### CLI additions
+
+* `--cache-dir <DIR>` on `render`: outputs go to a persistent cache instead of
+  unique per-invocation names. Cache key = hash of (canonical path, file size,
+  file mtime, `--size`, `--crop-size`, a render-format version constant).
+  Files: `<key>.kv` (the full kv block as printed), `<key>-overview.jpg`,
+  `<key>-crop.jpg`. On a hit, print the stored kv (paths still valid) without
+  decoding anything and touch the `.kv` mtime (LRU). Writes are atomic
+  (temp file + rename) because the on-demand render and a batch may race on the
+  same key. When `--source` is given the cache is bypassed (old behaviour).
+  Paths inside a cache entry are stable, which is fine: content for a key never
+  changes. Add kv key `cached=true|false`.
+* New subcommand:
+  ```
+  focuspoint batch --cache-dir <DIR> [--list <FILE> | paths on stdin, one per line]
+                   [--size PX] [--crop-size PX] [--jobs N] [--format kv|json]
+                   [--cache-max-mb N (default 2048)]
+  ```
+  Renders every file (skipping cache hits) in parallel with N worker threads
+  (default: max(2, available_parallelism/2)), memory-conscious (each worker
+  holds one decoded image at a time). Prints, in INPUT order, one kv block per
+  file: first line `file=<input path as given>`, then the same keys `render`
+  prints, then a line `---`. Each file's failure is reported in its own block
+  (`status=error`), never aborts the batch. After the batch, prune the cache to
+  `--cache-max-mb` by deleting least-recently-used entries (all files of a key
+  together). Exit 0 unless the arguments themselves are bad.
+* Speed of a single cold `render`: measure; reduce if there are cheap wins
+  (e.g. decode the full-size embedded JPEG only once, avoid re-encoding work,
+  faster JPEG decoder/encoder settings, decode-to-region). Report before/after.
+
+### Plugin changes
+
+* Cache dir: `~/Library/Caches/focuspoint` on macOS
+  (`LrPathUtils.getStandardFilePath('home') .. '/Library/Caches/focuspoint'`),
+  temp dir on Windows.
+* Default image source for the overview becomes the camera's embedded JPEG.
+  The Lightroom-preview option stays, but under a NEW pref key so existing
+  installs also get the new default (off). Label: "Use Lightroom preview for
+  overview (shows edits, slower)". HEIF still uses the Lightroom preview
+  automatically (it's the only renderable source).
+* On-demand path: `render --cache-dir` in ONE process call (drop the separate
+  `info` call when the Lightroom preview isn't used). In-memory map
+  `photo.localIdentifier → parsed result`; on a target change with a hit
+  whose files still exist, show it immediately (no debounce). Misses: render
+  immediately; keep only a very short debounce (~80 ms) for misses; poll every
+  ~50 ms.
+* Prefetch task (separate `LrTasks` task, runs while the viewer is open and
+  the Lightroom-preview option is off): the photo list is
+  `catalog:getMultipleSelectedOrAllPhotos()` (filmstrip order assumed —
+  verify), paths via `catalog:batchGetRawMetadata`. Order candidates by
+  distance from the current target, forward first (+1, −1, +2, −2 …, with a
+  forward bias), skip videos/missing/known-cached/unsupported, and render them
+  in batches of ~12 via `focuspoint batch`. Re-plan after every batch (the user
+  has moved). Refresh the photo list when the target changes or every few
+  seconds. Cap: at most ~1000 photos around the target. Stop when the viewer
+  closes. Feed results into the same in-memory map so flips become hits.
+* Status line shows `cached` vs render time for the current photo, and a
+  small prefetch progress note (e.g. "pre-rendered 142/388").
+* Also let the one-off modal and "Read Focus Metadata" reuse the cache.
