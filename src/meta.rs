@@ -24,7 +24,8 @@ pub struct Meta {
     pub orientation: Option<u16>,
     pub has_makernote: bool,
     pub sony: Option<SonyInfo>,
-    /// JPEGs embedded in a TIFF/ARW (previews, JpgFromRaw), largest first.
+    /// JPEGs embedded in a TIFF/ARW (previews, JpgFromRaw) or listed in a
+    /// JPEG's MPF index (Sony: a 1616x1080 preview), largest first.
     pub jpegs: Vec<EmbeddedJpeg>,
     /// Dimensions of the file itself when it is a JPEG.
     pub image_dims: Option<(u32, u32)>,
@@ -55,6 +56,7 @@ pub fn read(data: &[u8]) -> Result<Meta, String> {
         Kind::Tiff => (0, data.len()),
         Kind::Jpeg => {
             m.image_dims = container::jpeg_dimensions(data);
+            m.jpegs = mpf_previews(data, m.image_dims);
             match container::jpeg_exif_offset(data) {
                 Some(off) => (off, data.len() - off),
                 None => return Ok(m),
@@ -169,6 +171,64 @@ fn collect_jpegs(
             });
         }
     }
+}
+
+const TAG_MP_ENTRY: u16 = 0xb002;
+
+/// Extra images of a JPEG listed in its MPF (APP2 "MPF\0") index whose
+/// aspect ratio matches the main image (`dims`) within 1%, so they show the
+/// same frame (camera previews; not e.g. stale previews of a cropped edit).
+fn mpf_previews(data: &[u8], dims: Option<(u32, u32)>) -> Vec<EmbeddedJpeg> {
+    let mut out = Vec::new();
+    let Some((mw, mh)) = dims else {
+        return out;
+    };
+    let main_aspect = mw as f64 / mh.max(1) as f64;
+    for (marker, off, len) in container::jpeg_segments(data) {
+        if marker != 0xE2 || len < 12 || !data[off..].starts_with(b"MPF\0") {
+            continue;
+        }
+        // MPF offsets are relative to the TIFF header after "MPF\0".
+        let base = off + 4;
+        let Some((t, ifd0)) = Tiff::parse(&data[base..off + len]) else {
+            continue;
+        };
+        let Some((entries, _)) = t.read_ifd(ifd0) else {
+            continue;
+        };
+        let Some(e) = find(&entries, TAG_MP_ENTRY) else {
+            continue;
+        };
+        // 16 bytes per image: attributes, size, offset, 2 dependents.
+        // Entry 0 is the primary image itself.
+        for i in 1..(e.count as usize / 16).min(16) {
+            let at = e.value_offset + i * 16;
+            let (Some(size), Some(rel)) = (t.u32_at(at + 4), t.u32_at(at + 8)) else {
+                continue;
+            };
+            let (abs, l) = (base + rel as usize, size as usize);
+            let Some(bytes) = abs.checked_add(l).and_then(|end| data.get(abs..end)) else {
+                continue;
+            };
+            if !bytes.starts_with(&[0xFF, 0xD8]) {
+                continue;
+            }
+            let Some((w, h)) = container::jpeg_dimensions(bytes) else {
+                continue;
+            };
+            if ((w as f64 / h.max(1) as f64) / main_aspect - 1.0).abs() > 0.01 {
+                continue;
+            }
+            out.push(EmbeddedJpeg {
+                offset: abs,
+                len: l,
+                width: w,
+                height: h,
+            });
+        }
+    }
+    out.sort_by_key(|j| std::cmp::Reverse((j.width as u64) * (j.height as u64)));
+    out
 }
 
 /// Focus geometry in both the maker-note (sensor) space and normalised

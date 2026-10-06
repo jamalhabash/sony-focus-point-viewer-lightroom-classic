@@ -11,6 +11,12 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# libjpeg-turbo (mozjpeg fork), built statically from source via `cc`:
+# region-limited (jpeg_crop_scanline / jpeg_skip_scanlines) and DCT-scaled
+# decoding, and fast baseline encoding. NEON on aarch64; no nasm needed.
+mozjpeg-sys = { version = "2.2", default-features = false, features = ["with_simd", "unwinding"] }
+fast_image_resize = "6"
+memmap2 = "0.9"
 
 [profile.release]
 lto = "thin"

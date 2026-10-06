@@ -32,6 +32,7 @@
             fileset = lib.fileset.unions [
               ./Cargo.toml
               ./Cargo.lock
+              ./build.rs
               ./src
               ./tests
             ];
@@ -42,6 +43,19 @@
             version = (lib.importTOML ./Cargo.toml).package.version;
             src = cliSrc;
             cargoLock.lockFile = ./Cargo.lock;
+            # The plugin bundle is copied out of the store, so the binary must
+            # link only system libraries (libjpeg-turbo is built statically).
+            doInstallCheck = pkgs.stdenv.hostPlatform.isDarwin;
+            installCheckPhase = ''
+              runHook preInstallCheck
+              otool -L $out/bin/focuspoint > linked.txt
+              cat linked.txt
+              if tail -n +2 linked.txt | grep -v -E '^[[:space:]]+/(usr/lib|System)/'; then
+                echo "focuspoint links non-system libraries (above)" >&2
+                exit 1
+              fi
+              runHook postInstallCheck
+            '';
             meta = {
               description = "Read and render the autofocus point of Sony a7 IV photos";
               mainProgram = "focuspoint";

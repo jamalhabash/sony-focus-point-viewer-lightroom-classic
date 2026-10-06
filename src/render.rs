@@ -1,8 +1,7 @@
 //! Image loading, orientation, focus-box drawing, cropping and JPEG output.
 
+use crate::jpeg;
 use anyhow::{anyhow, Context, Result};
-use image::codecs::jpeg::JpegEncoder;
-use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use std::path::{Path, PathBuf};
@@ -132,19 +131,6 @@ pub fn draw_focus(img: &mut RgbImage, b: PxBox) {
     );
 }
 
-/// Downscale so the long edge is at most `size` (never upscales).
-pub fn fit_long_edge(img: &DynamicImage, size: u32) -> DynamicImage {
-    let (w, h) = (img.width(), img.height());
-    let long = w.max(h);
-    if long <= size || size == 0 {
-        return img.clone();
-    }
-    let scale = size as f64 / long as f64;
-    let nw = ((w as f64 * scale).round() as u32).max(1);
-    let nh = ((h as f64 * scale).round() as u32).max(1);
-    img.resize_exact(nw, nh, FilterType::Triangle)
-}
-
 /// Crop rectangle (x, y, w, h) of at most `size`x`size` source pixels centred
 /// on (cx, cy) and clamped to the image bounds. 1:1 pixels, never upscaled.
 pub fn crop_rect(img_w: u32, img_h: u32, cx: f64, cy: f64, size: u32) -> (u32, u32, u32, u32) {
@@ -182,15 +168,6 @@ pub fn unique_stem(input: &Path) -> String {
     format!("{stem}-{}-{nanos}-{n}", std::process::id())
 }
 
-pub fn save_jpeg(img: &RgbImage, path: &Path, quality: u8) -> Result<()> {
-    let f = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    let mut w = std::io::BufWriter::new(f);
-    JpegEncoder::new_with_quality(&mut w, quality)
-        .encode_image(img)
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
-
 pub fn absolute(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| {
         if p.is_absolute() {
@@ -203,61 +180,243 @@ pub fn absolute(p: &Path) -> PathBuf {
     })
 }
 
-pub struct Rendered {
-    pub overview: PathBuf,
-    pub crop: Option<PathBuf>,
+/// Focus geometry as fractions of the displayed frame: (x, y, w, h).
+pub type NormFocus = (f64, f64, Option<f64>, Option<f64>);
+
+/// An image to render from.
+#[derive(Clone, Copy)]
+pub enum Source<'a> {
+    /// Encoded JPEG in stored (sensor) orientation; the EXIF `orientation`
+    /// is applied after decoding. `width`/`height` are the stored size.
+    Jpeg {
+        bytes: &'a [u8],
+        width: u32,
+        height: u32,
+        orientation: u16,
+    },
+    /// Already decoded, in display orientation.
+    Decoded(&'a RgbImage),
 }
 
-/// Render the overview (box drawn if `focus` is given) and, when both
-/// `focus` and `crop_src` are given, the 1:1 crop. Both images must be in
-/// display orientation and show the same full frame; they may differ in
-/// resolution (e.g. a Lightroom preview for the overview and the full-size
-/// embedded JPEG for the crop).
-pub fn render(
-    overview_src: &DynamicImage,
-    crop_src: Option<&DynamicImage>,
-    focus: Option<(f64, f64, Option<f64>, Option<f64>)>,
-    out_dir: &Path,
-    stem: &str,
-    size: u32,
-    crop_size: u32,
-) -> Result<Rendered> {
-    std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
-    let out_dir = absolute(out_dir);
-    if overview_src.width() == 0 || overview_src.height() == 0 {
-        return Err(anyhow!("empty source image"));
+impl<'a> Source<'a> {
+    /// A JPEG source; its size is read from the SOF header (no decoding).
+    pub fn jpeg(bytes: &'a [u8], orientation: u16) -> Result<Self> {
+        let (width, height) = crate::container::jpeg_dimensions(bytes)
+            .ok_or_else(|| anyhow!("decoding JPEG: no frame header"))?;
+        Ok(Source::Jpeg {
+            bytes,
+            width,
+            height,
+            orientation,
+        })
     }
 
-    let mut ov = fit_long_edge(overview_src, size).to_rgb8();
+    /// Size in display orientation.
+    pub fn display_dims(&self) -> (u32, u32) {
+        match *self {
+            Source::Jpeg {
+                width,
+                height,
+                orientation,
+                ..
+            } => {
+                if crate::meta::swaps_axes(orientation) {
+                    (height, width)
+                } else {
+                    (width, height)
+                }
+            }
+            Source::Decoded(img) => img.dimensions(),
+        }
+    }
+
+    /// The whole frame in display orientation, long edge reduced to `size`
+    /// (never upscaled). Big JPEGs are downscaled in the DCT domain first.
+    pub fn overview(&self, size: u32) -> Result<RgbImage> {
+        let (dw, dh) = self.display_dims();
+        let (tw, th) = fit_dims(dw, dh, size);
+        let img = match *self {
+            Source::Jpeg {
+                bytes, orientation, ..
+            } => {
+                let img = jpeg::decode(bytes, jpeg::Want::MinLongEdge(size))
+                    .or_else(|_| fallback_decode(bytes))?;
+                orient(img, orientation)
+            }
+            Source::Decoded(img) => {
+                if img.dimensions() == (tw, th) {
+                    return Ok(img.clone());
+                }
+                return resize(img, tw, th);
+            }
+        };
+        if img.dimensions() == (tw, th) {
+            Ok(img)
+        } else {
+            resize(&img, tw, th)
+        }
+    }
+
+    /// A 1:1 region given in display coordinates.
+    pub fn region(&self, x: u32, y: u32, w: u32, h: u32) -> Result<RgbImage> {
+        match *self {
+            Source::Jpeg {
+                bytes,
+                width,
+                height,
+                orientation,
+            } => {
+                let (sx, sy, sw, sh) = stored_rect(orientation, width, height, (x, y, w, h));
+                let img = match jpeg::decode(bytes, jpeg::Want::Region(sx, sy, sw, sh)) {
+                    Ok(img) => img,
+                    Err(e) => {
+                        let full = fallback_decode(bytes).map_err(|_| e)?;
+                        if full.dimensions() != (width, height) {
+                            return Err(anyhow!("decoding JPEG: unexpected size"));
+                        }
+                        image::imageops::crop_imm(&full, sx, sy, sw, sh).to_image()
+                    }
+                };
+                Ok(orient(img, orientation))
+            }
+            Source::Decoded(img) => Ok(image::imageops::crop_imm(img, x, y, w, h).to_image()),
+        }
+    }
+}
+
+/// Decoder of last resort (CMYK, arithmetic coding, ...): the `image` crate.
+fn fallback_decode(bytes: &[u8]) -> Result<RgbImage> {
+    Ok(decode_jpeg(bytes)?.into_rgb8())
+}
+
+/// Apply an EXIF orientation to an RGB image.
+pub fn orient(img: RgbImage, o: u16) -> RgbImage {
+    if o <= 1 || o > 8 {
+        return img;
+    }
+    apply_orientation(DynamicImage::ImageRgb8(img), o).into_rgb8()
+}
+
+/// Map a rectangle in display coordinates to the stored (pre-orientation)
+/// image of `w`x`h`.
+pub fn stored_rect(o: u16, w: u32, h: u32, r: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+    let (w, h) = (w as i64, h as i64);
+    let map = |x: i64, y: i64| match o {
+        2 => (w - x, y),
+        3 => (w - x, h - y),
+        4 => (x, h - y),
+        5 => (y, x),
+        6 => (y, h - x),
+        7 => (w - y, h - x),
+        8 => (w - y, x),
+        _ => (x, y),
+    };
+    let (x0, y0) = map(r.0 as i64, r.1 as i64);
+    let (x1, y1) = map((r.0 + r.2) as i64, (r.1 + r.3) as i64);
+    let (xa, xb) = (x0.min(x1), x0.max(x1));
+    let (ya, yb) = (y0.min(y1), y0.max(y1));
+    (xa as u32, ya as u32, (xb - xa) as u32, (yb - ya) as u32)
+}
+
+/// Size with the long edge reduced to `size` (never upscaled).
+pub fn fit_dims(w: u32, h: u32, size: u32) -> (u32, u32) {
+    let long = w.max(h);
+    if long <= size || size == 0 {
+        return (w, h);
+    }
+    let scale = size as f64 / long as f64;
+    (
+        ((w as f64 * scale).round() as u32).max(1),
+        ((h as f64 * scale).round() as u32).max(1),
+    )
+}
+
+/// Bilinear (triangle) resampling, SIMD-accelerated.
+pub fn resize(img: &RgbImage, w: u32, h: u32) -> Result<RgbImage> {
+    use fast_image_resize as fir;
+    let src = fir::images::ImageRef::new(
+        img.width(),
+        img.height(),
+        img.as_raw(),
+        fir::PixelType::U8x3,
+    )?;
+    let mut dst = fir::images::Image::new(w, h, fir::PixelType::U8x3);
+    let opts = fir::ResizeOptions::new()
+        .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Bilinear));
+    fir::Resizer::new().resize(&src, &mut dst, &opts)?;
+    RgbImage::from_raw(w, h, dst.into_vec()).ok_or_else(|| anyhow!("resize: bad buffer"))
+}
+
+static TMP_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Write `bytes` to `path` atomically: a temporary file in the same
+/// directory, then rename (concurrent writers of the same path are fine).
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("bad output path {}", path.display()))?
+        .to_string_lossy();
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!("{name}.{}-{n}.tmp", std::process::id()));
+    let res = std::fs::write(&tmp, bytes)
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .with_context(|| format!("writing {}", path.display()));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+pub const OVERVIEW_QUALITY: u8 = 88;
+pub const CROP_QUALITY: u8 = 90;
+
+/// Write the overview: whole frame, long edge `size`, focus box if known.
+/// Returns the size of the written image.
+pub fn render_overview(
+    src: &Source,
+    focus: Option<NormFocus>,
+    size: u32,
+    path: &Path,
+) -> Result<(u32, u32)> {
+    let (w, h) = src.display_dims();
+    if w == 0 || h == 0 {
+        return Err(anyhow!("empty source image"));
+    }
+    let mut ov = src.overview(size)?;
     if let Some((nx, ny, nw, nh)) = focus {
         let b = px_box(ov.width(), ov.height(), nx, ny, nw, nh);
         draw_focus(&mut ov, b);
     }
-    let overview = out_dir.join(format!("{stem}-overview.jpg"));
-    save_jpeg(&ov, &overview, 88)?;
+    write_atomic(path, &jpeg::encode(&ov, OVERVIEW_QUALITY)?)?;
+    Ok(ov.dimensions())
+}
 
-    let mut crop = None;
-    if let (Some((nx, ny, nw, nh)), Some(crop_src)) = (focus, crop_src) {
-        let (sw, sh) = (crop_src.width(), crop_src.height());
-        if sw == 0 || sh == 0 {
-            return Err(anyhow!("empty crop source image"));
-        }
-        let b = px_box(sw, sh, nx, ny, nw, nh);
-        let (x, y, w, h) = crop_rect(sw, sh, b.cx, b.cy, crop_size);
-        let mut c = crop_src.crop_imm(x, y, w, h).to_rgb8();
-        draw_focus(
-            &mut c,
-            PxBox {
-                cx: b.cx - x as f64,
-                cy: b.cy - y as f64,
-                ..b
-            },
-        );
-        let p = out_dir.join(format!("{stem}-crop.jpg"));
-        save_jpeg(&c, &p, 90)?;
-        crop = Some(p);
+/// Write the 1:1 crop (at most `crop_size` square) around the focus point,
+/// with the focus box drawn. Returns the size of the written image.
+pub fn render_crop(
+    src: &Source,
+    focus: NormFocus,
+    crop_size: u32,
+    path: &Path,
+) -> Result<(u32, u32)> {
+    let (sw, sh) = src.display_dims();
+    if sw == 0 || sh == 0 {
+        return Err(anyhow!("empty crop source image"));
     }
-    Ok(Rendered { overview, crop })
+    let (nx, ny, nw, nh) = focus;
+    let b = px_box(sw, sh, nx, ny, nw, nh);
+    let (x, y, w, h) = crop_rect(sw, sh, b.cx, b.cy, crop_size);
+    let mut c = src.region(x, y, w, h)?;
+    draw_focus(
+        &mut c,
+        PxBox {
+            cx: b.cx - x as f64,
+            cy: b.cy - y as f64,
+            ..b
+        },
+    );
+    write_atomic(path, &jpeg::encode(&c, CROP_QUALITY)?)?;
+    Ok(c.dimensions())
 }
 
 #[cfg(test)]
@@ -299,21 +458,78 @@ mod tests {
     #[test]
     fn render_writes_files() {
         let dir = std::env::temp_dir().join(format!("focuspoint-test-{}", std::process::id()));
-        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(1200, 800, Rgb([40, 40, 40])));
-        let r = render(
-            &img,
-            Some(&img),
-            Some((0.25, 0.5, None, None)),
-            &dir,
-            "t",
-            600,
-            400,
-        )
-        .unwrap();
-        let ov = image::open(&r.overview).unwrap();
-        assert_eq!((ov.width(), ov.height()), (600, 400));
-        let c = image::open(r.crop.as_ref().unwrap()).unwrap();
-        assert_eq!((c.width(), c.height()), (400, 400));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = RgbImage::from_pixel(1200, 800, Rgb([40, 40, 40]));
+        let focus = (0.25, 0.5, None, None);
+        let ov = dir.join("t-overview.jpg");
+        let cr = dir.join("t-crop.jpg");
+        for src in [
+            Source::Decoded(&img),
+            Source::jpeg(&jpeg::encode(&img, 90).unwrap(), 1).unwrap(),
+        ] {
+            assert_eq!(
+                render_overview(&src, Some(focus), 600, &ov).unwrap(),
+                (600, 400)
+            );
+            assert_eq!(render_crop(&src, focus, 400, &cr).unwrap(), (400, 400));
+            let o = image::open(&ov).unwrap();
+            assert_eq!((o.width(), o.height()), (600, 400));
+            let c = image::open(&cr).unwrap();
+            assert_eq!((c.width(), c.height()), (400, 400));
+        }
+        // No temp files left behind.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cropping a region of the stored image and then orienting it must equal
+    /// orienting first and cropping the display image, for all 8 orientations.
+    #[test]
+    fn region_matches_orient_then_crop() {
+        let (w, h) = (48u32, 32u32);
+        let stored = RgbImage::from_fn(w, h, |x, y| Rgb([x as u8, y as u8, 7]));
+        for o in 1..=8u16 {
+            let disp = orient(stored.clone(), o);
+            let (dw, dh) = disp.dimensions();
+            for &(x, y, cw, ch) in &[(0, 0, dw, dh), (3, 5, 10, 7), (dw - 4, dh - 6, 4, 6)] {
+                let want = image::imageops::crop_imm(&disp, x, y, cw, ch).to_image();
+                let (sx, sy, sw, sh) = stored_rect(o, w, h, (x, y, cw, ch));
+                let got = orient(
+                    image::imageops::crop_imm(&stored, sx, sy, sw, sh).to_image(),
+                    o,
+                );
+                assert_eq!(got, want, "orientation {o} rect {x},{y} {cw}x{ch}");
+            }
+        }
+    }
+
+    #[test]
+    fn jpeg_source_orientation_and_overview_size() {
+        let stored = RgbImage::from_fn(320, 200, |x, _| {
+            if x < 160 {
+                Rgb([250, 10, 10])
+            } else {
+                Rgb([10, 10, 250])
+            }
+        });
+        let bytes = jpeg::encode(&stored, 95).unwrap();
+        // Orientation 6 (rotate 90 CW): stored left half ends up on top.
+        let src = Source::jpeg(&bytes, 6).unwrap();
+        assert_eq!(src.display_dims(), (200, 320));
+        let ov = src.overview(100).unwrap();
+        assert_eq!(ov.dimensions(), (63, 100));
+        let top = src.region(50, 10, 100, 100).unwrap();
+        assert_eq!(top.dimensions(), (100, 100));
+        assert!(
+            top.get_pixel(50, 50)[0] > 200,
+            "{:?}",
+            top.get_pixel(50, 50)
+        );
+        let bottom = src.region(50, 210, 100, 100).unwrap();
+        assert!(bottom.get_pixel(50, 50)[2] > 200);
     }
 }

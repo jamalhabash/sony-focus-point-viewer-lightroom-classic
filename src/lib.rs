@@ -2,7 +2,10 @@
 //! Sony maker note decoding and focus-box rendering.
 
 pub mod app;
+pub mod batch;
+pub mod cache;
 pub mod container;
+pub mod jpeg;
 pub mod meta;
 pub mod output;
 pub mod render;

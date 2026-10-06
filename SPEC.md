@@ -188,6 +188,39 @@ perceptible delay, even when scrubbing quickly.
   (e.g. decode the full-size embedded JPEG only once, avoid re-encoding work,
   faster JPEG decoder/encoder settings, decode-to-region). Report before/after.
 
+* Implementation notes (Rust CLI, v0.2):
+  * `render` needs `--out-dir` or `--cache-dir` (or both). `cached=` is only
+    printed when `--cache-dir` is given. With `--cache-dir` + `--source` and
+    no `--out-dir`, the unique-name outputs go to `<cache-dir>/uncached/`
+    (`batch` deletes those after 1 h).
+  * Cache key: 16 lowercase hex digits (FNV-1a 64 + mix over the inputs
+    above; render-format version constant = 2). `error` results are not
+    cached (may be transient); `ok`, `no_focus`, `unsupported` are. An entry
+    whose `.kv` lists an image file that no longer exists is a miss. The
+    `.kv` is written last, so a `.kv` means a complete entry. Nothing is
+    stored if the input file changed while rendering.
+  * `batch`: `--format` defaults to `kv`; `json` prints one JSON array of
+    objects (`"file"` first). Empty input lines are skipped. Blocks are
+    streamed in input order as they complete. Exit 2 for bad arguments
+    (incl. an unreadable `--list`), 1 only if stdout fails. Each render uses
+    two threads (overview ∥ crop), hence default jobs = cores/2.
+  * Prune: entries ordered by `.kv` mtime; only files named like cache
+    entries are touched (plus stale `*.tmp` and orphaned images > 10 min).
+  * Camera JPEG inputs: Sony JPEGs carry a 1616x1080 preview in their MPF
+    (APP2) index; when it is >= `--size` (and its aspect matches the main
+    image within 1%) the overview is drawn from it, reported as
+    `source=embedded_preview` (was `image`). The crop still comes from the
+    full image (`crop_source=image`).
+  * Speed: JPEGs are decoded with a statically built libjpeg-turbo
+    (`mozjpeg-sys`, NEON on aarch64): the crop decodes only its region
+    (`jpeg_skip_scanlines`/`jpeg_crop_scanline`), big overview sources are
+    DCT-downscaled, orientation is applied after cropping/scaling, encoding
+    uses the libjpeg-turbo baseline encoder, resizing `fast_image_resize`,
+    raw files are mmapped, overview and crop render in parallel. Cold
+    `render` of the 7008x4672 FF ARW: ~155 ms -> ~31 ms (M-series, warm
+    file cache). The binary still links only libSystem on macOS (checked
+    in the Nix build).
+
 ### Plugin changes
 
 * Cache dir: `~/Library/Caches/focuspoint` on macOS
