@@ -87,6 +87,134 @@ eq(kv.last, 'no-newline', 'kv last line without newline')
 eq(next(Core.parseKv('')), nil, 'kv empty input')
 eq(next(Core.parseKv(nil)), nil, 'kv nil input')
 
+-- parseKvBlocks (batch output) -------------------------------------------------
+local blocks = Core.parseKvBlocks(table.concat({
+	'noise before any block=ignored',
+	'file=/photos/a b/DSC1.ARW',
+	'status=ok',
+	'overview=/c/k1-overview.jpg',
+	'cached=true',
+	'---',
+	'file=/photos/it\'s=2.ARW',
+	'status=error',
+	'message=bad\\nfile',
+	'---\r',
+	'',
+	'file=/photos/3.ARW',
+	'status=unsupported',
+	'file=/photos/4.ARW', -- new block without a terminator before it
+	'status=no_focus',
+}, '\n'))
+eq(#blocks, 4, 'blocks: count')
+eq(blocks[1].file, '/photos/a b/DSC1.ARW', 'blocks: file with space')
+eq(blocks[1].status, 'ok', 'blocks: status')
+eq(blocks[1].cached, 'true', 'blocks: cached')
+eq(blocks[1].noise, nil, 'blocks: lines before first file= ignored')
+eq(blocks[2].file, '/photos/it\'s=2.ARW', 'blocks: file with = and quote')
+eq(blocks[2].message, 'bad\nfile', 'blocks: escaped value')
+eq(blocks[2].overview, nil, 'blocks: keys do not leak between blocks')
+eq(blocks[3].status, 'unsupported', 'blocks: unterminated block')
+eq(blocks[4].file, '/photos/4.ARW', 'blocks: last block without ---')
+eq(blocks[4].status, 'no_focus', 'blocks: last block status')
+eq(#Core.parseKvBlocks(''), 0, 'blocks: empty')
+eq(#Core.parseKvBlocks(nil), 0, 'blocks: nil')
+eq(#Core.parseKvBlocks('status=ok\n---\n'), 0, 'blocks: no file= line')
+eq(#Core.parseKvBlocks('file=/x\r\n---\r\nfile=/y\r\n---\r\n'), 2, 'blocks: CRLF')
+
+-- prefetch ordering --------------------------------------------------------------
+local function join(t)
+	local parts = {}
+	for i, v in ipairs(t) do
+		parts[i] = tostring(v)
+	end
+	return table.concat(parts, ',')
+end
+eq(join(Core.prefetchOrder(20, 10, 10)), '11,9,12,13,8,14,7,15,16,6', 'order: forward bias 1.5')
+eq(join(Core.prefetchOrder(20, 10, 6, 1)), '11,9,12,8,13,7', 'order: weight 1 alternates +1,-1,+2,-2')
+eq(join(Core.prefetchOrder(5, 1, 100)), '2,3,4,5', 'order: at start only forward')
+eq(join(Core.prefetchOrder(5, 5, 100)), '4,3,2,1', 'order: at end only backward')
+eq(join(Core.prefetchOrder(6, 5, 100)), '6,4,3,2,1', 'order: forward exhausted then backward')
+eq(join(Core.prefetchOrder(1, 1, 100)), '', 'order: single photo')
+eq(join(Core.prefetchOrder(10, nil, 100)), '', 'order: unknown target')
+eq(join(Core.prefetchOrder(10, 11, 100)), '', 'order: target out of range')
+eq(join(Core.prefetchOrder(0, 1, 100)), '', 'order: empty list')
+local big = Core.prefetchOrder(100000, 50000, 1000)
+eq(#big, 1000, 'order: capped')
+do
+	local seen, dup, maxDist = {}, false, 0
+	for _, i in ipairs(big) do
+		if seen[i] or i == 50000 then
+			dup = true
+		end
+		seen[i] = true
+		maxDist = math.max(maxDist, math.abs(i - 50000))
+	end
+	ok(not dup, 'order: no duplicates, target excluded')
+	ok(maxDist <= 600, 'order: cap keeps the closest photos')
+end
+do
+	-- Every index except the target exactly once.
+	local o = Core.prefetchOrder(37, 12, 1000)
+	local seen = {}
+	for _, i in ipairs(o) do
+		seen[i] = (seen[i] or 0) + 1
+	end
+	local okAll = #o == 36
+	for i = 1, 37 do
+		if i ~= 12 and seen[i] ~= 1 then
+			okAll = false
+		end
+	end
+	ok(okAll, 'order: complete permutation without the target')
+end
+
+-- pickBatch
+local order = Core.prefetchOrder(30, 10, 100)
+local function classifyFrom(t)
+	return function(i)
+		return t[i]
+	end
+end
+local groups = {}
+for i = 1, 30 do
+	groups[i] = 640
+end
+groups[11] = nil -- already cached
+groups[9] = 480 -- portrait
+local picked, g = Core.pickBatch(order, classifyFrom(groups), 4, 8)
+eq(g, 480, 'pickBatch: group of the first eligible (index 9)')
+eq(join(picked), '9', 'pickBatch: only same-group within lookahead')
+groups[9] = 640
+picked, g = Core.pickBatch(order, classifyFrom(groups), 4, 8)
+eq(join(picked), '9,12,13,8', 'pickBatch: skips done, keeps order')
+eq(g, 640, 'pickBatch: group')
+picked, g = Core.pickBatch(order, function() return nil end, 4)
+eq(#picked, 0, 'pickBatch: nothing eligible')
+eq(g, nil, 'pickBatch: no group')
+
+-- sizes / small helpers -------------------------------------------------------------
+eq(Core.guessOverviewSize(1.5, 640, 480), 640, 'guess size landscape')
+eq(Core.guessOverviewSize(2 / 3, 640, 480), 480, 'guess size portrait')
+eq(Core.guessOverviewSize(1.25, 640, 480), 640, 'guess size cropped landscape quantised')
+eq(Core.guessOverviewSize(nil, 640, 480), 640, 'guess size unknown')
+eq(Core.guessOverviewSize(0.8, 800, 600), 600, 'guess size portrait modal')
+eq(Core.preferredOverviewSize(1.5, 640, 480), 640, 'preferred landscape')
+eq(Core.preferredOverviewSize(1, 640, 480), 480, 'preferred square')
+eq(Core.leafName('/a/b/DSC1.ARW'), 'DSC1.ARW', 'leafName posix')
+eq(Core.leafName('C:\\a\\DSC1.ARW'), 'DSC1.ARW', 'leafName windows')
+eq(Core.leafName(nil), nil, 'leafName nil')
+ok(Core.isHeifPath('/x/DSC1.HIF'), 'heif .HIF')
+ok(Core.isHeifPath('/x/a.heic'), 'heif .heic')
+ok(not Core.isHeifPath('/x.hif/a.ARW'), 'heif only extension')
+ok(not Core.isHeifPath(nil), 'heif nil')
+eq(Core.ms(0.0123), 12, 'ms')
+eq(Core.ms(nil), -1, 'ms nil')
+eq(Core.prefetchNote(3, 10, true), 'pre-rendered 3/10\226\128\166', 'prefetch note active')
+eq(Core.prefetchNote(10, 10, false), '10 nearby photos pre-rendered', 'prefetch note done')
+eq(Core.prefetchNote(0, 0, false), '', 'prefetch note empty')
+eq(Core.renderNote({ cached = true }), 'cached', 'render note cached')
+eq(Core.renderNote({ timing = { total = 0.314 } }), 'rendered in 0.31 s', 'render note time')
+
 -- shell quoting ----------------------------------------------------------------
 eq(Core.shellQuotePosix('abc'), "'abc'", 'posix simple')
 eq(Core.shellQuotePosix("it's"), "'it'\\''s'", 'posix embedded quote')

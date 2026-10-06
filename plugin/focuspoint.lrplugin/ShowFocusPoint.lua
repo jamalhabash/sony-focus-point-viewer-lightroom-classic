@@ -2,6 +2,9 @@
 ShowFocusPoint.lua
 
 Menu item: "Show Focus Point" – one-off modal dialog for the active photo.
+Uses the CLI render cache (one `render --cache-dir` call; instant when the
+photo was shown at this size before) unless the Lightroom-preview option is
+on. Only Lightroom-preview renders (ephemeral files) are deleted on close.
 ------------------------------------------------------------------------------]]
 
 local LrApplication = import 'LrApplication'
@@ -12,6 +15,7 @@ local LrProgressScope = import 'LrProgressScope'
 local LrTasks = import 'LrTasks'
 local LrView = import 'LrView'
 
+local Core = require 'FocusPointCore'
 local Cli = require 'FocusPointCli'
 local Viewer = require 'FocusPointViewer'
 local log = require 'FocusPointLog'
@@ -32,7 +36,7 @@ LrFunctionContext.postAsyncTaskWithContext('FocusPointShow', function(context)
 		return
 	end
 
-	local prefs = Viewer.prefs()
+	local useLrPreview = Viewer.useLrPreviewPref()
 	Cli.cleanupRenders(600)
 
 	local progress = LrProgressScope {
@@ -44,20 +48,21 @@ LrFunctionContext.postAsyncTaskWithContext('FocusPointShow', function(context)
 	local sizes = Viewer.MODAL_SIZES
 	local result = Cli.analyze(photo, {
 		render = true,
-		useLrPreview = prefs.useLrPreview ~= false,
+		cacheDir = Cli.cacheDir(),
+		useLrPreview = useLrPreview,
 		boxW = sizes.overviewW,
 		boxH = sizes.overviewH,
 		cropSize = sizes.crop,
 	})
 	progress:done()
+	local timing = result.timing or {}
+	log:infof('timing: modal file=%s total_ms=%d exec_ms=%d preview_ms=%d calls=%d cli_cached=%s result=%s',
+		tostring(result.fileName), Core.ms(timing.total), Core.ms(timing.exec or 0), Core.ms(timing.preview or 0),
+		timing.calls or 0, tostring(result.cached), tostring(result.kind))
 
-	local files = {}
-	if result.overview then
-		files[#files + 1] = result.overview
-	end
-	if result.crop then
-		files[#files + 1] = result.crop
-	end
+	-- Cache files belong to the render cache; only delete Lightroom-preview
+	-- renders.
+	local files = result.ephemeral and Cli.resultFiles(result) or {}
 	context:addCleanupHandler(function()
 		for _, p in ipairs(files) do
 			Cli.deleteFile(p)
@@ -75,7 +80,7 @@ LrFunctionContext.postAsyncTaskWithContext('FocusPointShow', function(context)
 	local f = LrView.osFactory()
 	local props = LrBinding.makePropertyTable(context)
 	Viewer.initProps(props)
-	Viewer.applyResult(props, result, Viewer.flagText(photo))
+	Viewer.applyResult(props, result, Viewer.flagText(photo), Core.renderNote(result))
 	props.flagEnabled = true
 
 	local contents = Viewer.buildContents(f, props, {

@@ -77,6 +77,46 @@ function Core.parseKv(text)
 	return result
 end
 
+--- Parse the output of `focuspoint batch --format kv`: one block per input
+-- file, starting with `file=<path>` and ending with a line `---`.
+-- Returns an array of kv tables (each with a `file` key), in output order.
+-- Tolerant of a missing final `---` and of a `file=` line that starts a new
+-- block before the previous one was terminated. Lines before the first
+-- `file=` line are ignored.
+function Core.parseKvBlocks(text)
+	local blocks = {}
+	if type(text) ~= 'string' or text == '' then
+		return blocks
+	end
+	local current = nil
+	local function finish()
+		if current and current.file then
+			blocks[#blocks + 1] = current
+		end
+		current = nil
+	end
+	for line in string.gmatch(text .. '\n', '([^\n]*)\n') do
+		line = string.gsub(line, '\r$', '')
+		if line == '---' then
+			finish()
+		else
+			local eq = string.find(line, '=', 1, true)
+			if eq and eq > 1 then
+				local key = string.match(string.sub(line, 1, eq - 1), '^%s*(.-)%s*$')
+				local value = Core.unescapeValue(string.sub(line, eq + 1))
+				if key == 'file' then
+					finish()
+					current = { file = value }
+				elseif key ~= '' and current then
+					current[key] = value
+				end
+			end
+		end
+	end
+	finish()
+	return blocks
+end
+
 --- tonumber() that tolerates nil and surrounding whitespace.
 function Core.num(v)
 	if v == nil then
@@ -258,6 +298,154 @@ function Core.fitLongEdge(aspect, boxW, boxH)
 		size = math.min(boxH, boxW / aspect)
 	end
 	return math.floor(size)
+end
+
+--- Overview --size to request for a photo *before* its real (camera,
+-- orientation-applied) aspect is known, from a guess such as Lightroom's
+-- `aspectRatio` (which reflects Develop crops/rotation). Quantised to the
+-- 3:2 landscape / 2:3 portrait sizes so that the prefetch task and the
+-- on-demand path ask for the same size (= the same CLI cache entry) and
+-- small crops don't produce odd sizes. A wrong guess is corrected once the
+-- real aspect is known (see Core.preferredOverviewSize).
+function Core.guessOverviewSize(aspect, boxW, boxH)
+	aspect = tonumber(aspect)
+	if aspect and aspect > 0 and aspect < 1 then
+		return Core.fitLongEdge(2 / 3, boxW, boxH)
+	end
+	return Core.fitLongEdge(3 / 2, boxW, boxH)
+end
+
+--- The --size an overview of real aspect `aspect` should have to fill the
+-- box (same as fitLongEdge; named for intent).
+function Core.preferredOverviewSize(aspect, boxW, boxH)
+	return Core.fitLongEdge(aspect, boxW, boxH)
+end
+
+--------------------------------------------------------------------------------
+-- Prefetch planning
+--------------------------------------------------------------------------------
+
+--- Order in which to pre-render the photos of a list of `n` photos when the
+-- user is at index `target` (1-based). Returns an array of indices sorted by
+-- distance from the target with a forward bias, excluding the target itself
+-- (the on-demand path renders that one): a backward step of distance d is
+-- treated like a forward step of distance d * backwardWeight, ties go
+-- forward. With the default weight 1.5:
+--   +1, -1, +2, +3, -2, +4, -3, +5, +6, -4, ...
+-- At most `limit` indices are returned (the closest ones). Indices outside
+-- 1..n are never produced. If `target` is nil or out of range, returns {}.
+function Core.prefetchOrder(n, target, limit, backwardWeight)
+	local order = {}
+	n = tonumber(n) or 0
+	target = tonumber(target)
+	if not target or target < 1 or target > n then
+		return order
+	end
+	limit = tonumber(limit) or n
+	backwardWeight = tonumber(backwardWeight) or 1.5
+	local f, b = 1, 1
+	while #order < limit do
+		local canF = target + f <= n
+		local canB = target - b >= 1
+		if not canF and not canB then
+			break
+		end
+		if canF and (not canB or f <= b * backwardWeight) then
+			order[#order + 1] = target + f
+			f = f + 1
+		else
+			order[#order + 1] = target - b
+			b = b + 1
+		end
+	end
+	return order
+end
+
+--- Pick the next prefetch batch from `order` (see prefetchOrder).
+-- `classify(i)` returns a group value (e.g. the --size to render at) for an
+-- index that still needs rendering, or nil to skip it (done, video, ...).
+-- All members of a batch share the group of the first eligible index; other
+-- groups are left for a later batch. Only the first `lookahead` eligible
+-- indices are considered, so a batch never reaches far past photos of
+-- another group that are closer to the target.
+-- Returns indices (array, in order) and the group value (nil if empty).
+function Core.pickBatch(order, classify, batchSize, lookahead)
+	local picked = {}
+	local group = nil
+	local seen = 0
+	lookahead = lookahead or batchSize * 2
+	for _, i in ipairs(order) do
+		if #picked >= batchSize or seen >= lookahead then
+			break
+		end
+		local g = classify(i)
+		if g ~= nil then
+			seen = seen + 1
+			if group == nil then
+				group = g
+			end
+			if g == group then
+				picked[#picked + 1] = i
+			end
+		end
+	end
+	return picked, group
+end
+
+--------------------------------------------------------------------------------
+-- Small path / formatting helpers
+--------------------------------------------------------------------------------
+
+--- Last path component (works with / and \ separators).
+function Core.leafName(path)
+	if type(path) ~= 'string' then
+		return nil
+	end
+	return string.match(path, '([^/\\]+)[/\\]*$') or path
+end
+
+--- True for HEIF/HEIC/HIF file names (the CLI can't decode HEVC, so these
+-- need a Lightroom preview as --source).
+function Core.isHeifPath(path)
+	if type(path) ~= 'string' then
+		return false
+	end
+	local ext = string.lower(string.match(path, '%.([^./\\]+)$') or '')
+	return ext == 'heif' or ext == 'heic' or ext == 'hif'
+end
+
+--- Seconds -> integer milliseconds (for `timing:` log lines). nil -> -1.
+function Core.ms(seconds)
+	if type(seconds) ~= 'number' then
+		return -1
+	end
+	return math.floor(seconds * 1000 + 0.5)
+end
+
+--- Short "rendered in 0.31 s" style note for the status line.
+function Core.renderNote(result)
+	if type(result) ~= 'table' then
+		return nil
+	end
+	if result.fromMemory or result.cached then
+		return 'cached'
+	end
+	local t = result.timing
+	if t and type(t.total) == 'number' then
+		return string.format('rendered in %.2f s', t.total)
+	end
+	return nil
+end
+
+--- Prefetch progress note for the viewer.
+function Core.prefetchNote(done, total, active)
+	if not total or total <= 0 then
+		return ''
+	end
+	if done >= total then
+		return string.format('%d nearby photos pre-rendered', total)
+	end
+	return string.format('pre-rendered %d/%d%s', done, total, active and '\226\128\166' or '')
 end
 
 --------------------------------------------------------------------------------

@@ -2,11 +2,18 @@
 ReadFocusMetadata.lua
 
 Menu item: "Read Focus Metadata for Selected Photos".
-Runs `focuspoint info` for every selected photo and stores the result in the
-plug-in metadata fields declared in MetadataDefinition.lua.
+Reads the focus data of every selected photo and stores it in the plug-in
+metadata fields declared in MetadataDefinition.lua.
+
+Uses `focuspoint batch` through the render cache (Cli.analyzeBatch), CHUNK
+photos per call: cached photos are answered without decoding anything, and
+the rendered overviews/crops make the floating viewer instant for these
+photos afterwards. HEIF files (and everything, if `batch` is unavailable)
+fall back to one `focuspoint info` call per photo.
 ------------------------------------------------------------------------------]]
 
 local LrApplication = import 'LrApplication'
+local LrDate = import 'LrDate'
 local LrDialogs = import 'LrDialogs'
 local LrFunctionContext = import 'LrFunctionContext'
 local LrProgressScope = import 'LrProgressScope'
@@ -14,12 +21,15 @@ local LrTasks = import 'LrTasks'
 
 local Core = require 'FocusPointCore'
 local Cli = require 'FocusPointCli'
+local Viewer = require 'FocusPointViewer'
 local log = require 'FocusPointLog'
 
 -- Searchable plug-in fields must not exceed 511 bytes.
 local MAX_FIELD_BYTES = 500
 -- Photos per catalog write transaction.
 local WRITE_BATCH = 200
+-- Photos per `focuspoint batch` call (progress / cancel granularity).
+local CHUNK = 24
 
 local function field(v)
 	if v == nil or v == '' then
@@ -93,34 +103,53 @@ LrFunctionContext.postAsyncTaskWithContext('FocusPointReadMetadata', function(co
 	local firstError
 	local total = #photos
 
-	for i, photo in ipairs(photos) do
+	local cacheDir = Cli.cacheDir()
+	local sizes = Viewer.SIZES
+	local started = LrDate.currentTime()
+	local first = 1
+	while first <= total do
 		if progress:isCanceled() then
 			break
 		end
-		progress:setPortionComplete(i - 1, total)
-		local result = Cli.analyze(photo, { render = false })
-		progress:setCaption(result.fileName or '')
-
-		if result.kind == 'nocli' then
-			progress:done()
-			LrDialogs.message('Focus Point helper not usable', result.message, 'critical')
-			return
+		local last = math.min(first + CHUNK - 1, total)
+		progress:setPortionComplete(first - 1, total)
+		local chunk = {}
+		for i = first, last do
+			chunk[#chunk + 1] = photos[i]
 		end
+		progress:setCaption(string.format('%d\226\128\147%d of %d', first, last, total)) -- "–"
+		local results = Cli.analyzeBatch(chunk, {
+			cacheDir = cacheDir,
+			boxW = sizes.overviewW,
+			boxH = sizes.overviewH,
+			cropSize = sizes.crop,
+		})
 
-		local fields = fieldsFor(result)
-		if fields then
-			updates[#updates + 1] = { photo = photo, fields = fields }
-			counts[result.kind] = (counts[result.kind] or 0) + 1
-		elseif result.kind == 'error' then
-			counts.error = counts.error + 1
-			firstError = firstError or ((result.fileName or '?') .. ': ' .. tostring(result.message))
-			log:warnf('read metadata error for %s: %s', tostring(result.fileName), tostring(result.message))
-		else
-			-- video / missing original
-			counts.skipped = counts.skipped + 1
+		for j, photo in ipairs(chunk) do
+			local result = results[j] or { kind = 'error', message = 'no result' }
+			if result.kind == 'nocli' then
+				progress:done()
+				LrDialogs.message('Focus Point helper not usable', result.message, 'critical')
+				return
+			end
+
+			local fields = fieldsFor(result)
+			if fields then
+				updates[#updates + 1] = { photo = photo, fields = fields }
+				counts[result.kind] = (counts[result.kind] or 0) + 1
+			elseif result.kind == 'error' then
+				counts.error = counts.error + 1
+				firstError = firstError or ((result.fileName or '?') .. ': ' .. tostring(result.message))
+				log:warnf('read metadata error for %s: %s', tostring(result.fileName), tostring(result.message))
+			else
+				-- video / missing original
+				counts.skipped = counts.skipped + 1
+			end
 		end
+		first = last + 1
 		LrTasks.yield()
 	end
+	log:infof('timing: read-metadata n=%d total_ms=%d', total, Core.ms(LrDate.currentTime() - started))
 
 	local canceled = progress:isCanceled()
 	progress:setCaption('Saving\226\128\166')

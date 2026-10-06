@@ -6,7 +6,16 @@ Everything that talks to the `focuspoint` CLI or to the file system:
   * running it with LrTasks.execute, stdout/stderr redirected to temp files
   * exporting a Lightroom preview (photo:requestJpegThumbnail) as --source
   * the whole "analyse one photo" pipeline used by the viewer and the modal
-  * cleaning up old render output
+  * `focuspoint batch` (prefetch / Read Focus Metadata)
+  * the persistent render cache dir and cleaning up old (non-cache) output
+
+Render cache (SPEC v0.2): `render --cache-dir` / `batch --cache-dir` keep
+their output in Cli.cacheDir() under stable names keyed by (file, size,
+mtime, --size, --crop-size). Those files belong to the cache and must never
+be deleted by the plug-in (the CLI prunes the cache itself, LRU). Results
+rendered with --source (Lightroom preview) bypass the cache, go to
+Cli.renderDir() with unique names and are marked `ephemeral`: whoever shows
+them deletes them afterwards.
 
 All functions that call the SDK's photo/catalog/LrTasks APIs must run inside
 an LrTasks async task.
@@ -61,6 +70,20 @@ end
 --- <temp>/focuspoint/renders (passed to the CLI as --out-dir)
 function Cli.renderDir()
 	return ensureDir(LrPathUtils.child(Cli.workDir(), 'renders'))
+end
+
+--- Persistent render cache (--cache-dir):
+-- macOS ~/Library/Caches/focuspoint, Windows <temp>/focuspoint/cache.
+function Cli.cacheDirPath()
+	if WIN_ENV then
+		return LrPathUtils.child(LrPathUtils.child(LrPathUtils.getStandardFilePath('temp'), 'focuspoint'), 'cache')
+	end
+	local home = LrPathUtils.getStandardFilePath('home')
+	return LrPathUtils.child(LrPathUtils.child(LrPathUtils.child(home, 'Library'), 'Caches'), 'focuspoint')
+end
+
+function Cli.cacheDir()
+	return ensureDir(Cli.cacheDirPath())
 end
 
 Cli.INSTALL_HINT = 'Reinstall the plug-in with `nix run .#install` from the lr-focus-point '
@@ -156,11 +179,10 @@ end
 -- Running the CLI
 --------------------------------------------------------------------------------
 
---- Run `focuspoint <args...> --format kv`. Always returns a table; on
--- failure `status` is 'error' and `message` explains why.
--- Extra fields: _code (normalised exit code), _stderr.
---- Run the binary with `args`; returns stdout, stderr, normalised exit code.
--- Must be called from an async task (LrTasks.execute yields).
+--- Run the binary with `args`; returns stdout, stderr, normalised exit code
+-- and the elapsed wall time in seconds.
+-- Must be called from an async task. LrTasks.execute "blocks only the task
+-- that calls it", so several tasks may each run the CLI at the same time.
 function Cli.exec(args)
 	local work = Cli.workDir()
 	local id = nextId()
@@ -179,11 +201,11 @@ function Cli.exec(args)
 	Cli.deleteFile(errFile)
 
 	local code = Core.exitCode(rc)
-	log:debugf('focuspoint %s -> rc=%s (%.2fs)', tostring(args[1]), tostring(rc), elapsed)
+	log:debugf('focuspoint %s -> rc=%s (%d ms)', tostring(args[1]), tostring(rc), Core.ms(elapsed))
 	if err and err ~= '' then
 		log:debugf('stderr: %s', err)
 	end
-	return out, err, code
+	return out, err, code, elapsed
 end
 
 --- `focuspoint --version` (first line), or nil.
@@ -198,6 +220,10 @@ function Cli.version()
 	return nil
 end
 
+--- Run `focuspoint <args...> --format kv`. Always returns a table; on
+-- failure `status` is 'error' and `message` explains why.
+-- Extra fields: _code (normalised exit code), _stderr, _elapsed (seconds),
+-- _nocli (binary missing / not executable).
 function Cli.run(args)
 	local okBin, binMsg = Cli.checkBinary()
 	if not okBin then
@@ -211,11 +237,13 @@ function Cli.run(args)
 	fullArgs[#fullArgs + 1] = '--format'
 	fullArgs[#fullArgs + 1] = 'kv'
 
-	local out, err, code = Cli.exec(fullArgs)
+	local out, err, code, elapsed = Cli.exec(fullArgs)
 	local result = Core.parseKv(out)
 	result._code = code
 	result._stderr = err
-	log:infof('focuspoint %s -> exit=%s status=%s', tostring(args[1]), tostring(code), tostring(result.status))
+	result._elapsed = elapsed
+	log:infof('focuspoint %s -> exit=%s status=%s cached=%s (%d ms)', tostring(args[1]), tostring(code),
+		tostring(result.status), tostring(result.cached), Core.ms(elapsed))
 
 	if not result.status then
 		result.status = 'error'
@@ -232,9 +260,17 @@ function Cli.info(path)
 	return Cli.run({ 'info', path })
 end
 
---- opts: outDir, source (optional), size, cropSize
+--- opts: cacheDir or outDir, source (optional), size, cropSize.
+-- With a --source the CLI bypasses the cache, so --out-dir is used then.
 function Cli.render(path, opts)
-	local args = { 'render', path, '--out-dir', opts.outDir or Cli.renderDir() }
+	local args = { 'render', path }
+	if opts.cacheDir and not opts.source then
+		args[#args + 1] = '--cache-dir'
+		args[#args + 1] = opts.cacheDir
+	else
+		args[#args + 1] = '--out-dir'
+		args[#args + 1] = opts.outDir or Cli.renderDir()
+	end
 	if opts.source then
 		args[#args + 1] = '--source'
 		args[#args + 1] = opts.source
@@ -248,6 +284,58 @@ function Cli.render(path, opts)
 		args[#args + 1] = tostring(math.floor(opts.cropSize))
 	end
 	return Cli.run(args)
+end
+
+--- `focuspoint batch --cache-dir <dir> --list <tmpfile> ...` for `paths`.
+-- opts: cacheDir (required), size, cropSize, jobs.
+-- Returns blocks (array of kv tables, each with `file`, see
+-- Core.parseKvBlocks) and a meta table { code, stderr, elapsed, nocli,
+-- message (set when no block came back) }.
+-- Paths containing a newline can't be listed; callers must leave them out.
+function Cli.batch(paths, opts)
+	local meta = { elapsed = 0 }
+	local okBin, binMsg = Cli.checkBinary()
+	if not okBin then
+		meta.nocli = true
+		meta.message = binMsg
+		return {}, meta
+	end
+	if #paths == 0 then
+		return {}, meta
+	end
+	local listFile = LrPathUtils.child(Cli.workDir(), 'list-' .. nextId() .. '.txt')
+	local wrote, werr = writeFile(listFile, table.concat(paths, '\n') .. '\n')
+	if not wrote then
+		meta.message = 'could not write the batch list: ' .. tostring(werr)
+		return {}, meta
+	end
+	local args = { 'batch', '--cache-dir', opts.cacheDir, '--list', listFile }
+	if opts.size then
+		args[#args + 1] = '--size'
+		args[#args + 1] = tostring(math.floor(opts.size))
+	end
+	if opts.cropSize then
+		args[#args + 1] = '--crop-size'
+		args[#args + 1] = tostring(math.floor(opts.cropSize))
+	end
+	if opts.jobs then
+		args[#args + 1] = '--jobs'
+		args[#args + 1] = tostring(math.floor(opts.jobs))
+	end
+	args[#args + 1] = '--format'
+	args[#args + 1] = 'kv'
+	local out, err, code, elapsed = Cli.exec(args)
+	Cli.deleteFile(listFile)
+	local blocks = Core.parseKvBlocks(out)
+	meta.code = code
+	meta.stderr = err
+	meta.elapsed = elapsed
+	if #blocks == 0 then
+		meta.message = Core.describeExecFailure(code, err)
+		meta.nocli = code == 126 or code == 127
+		log:warnf('focuspoint batch (%d files) returned nothing: %s', #paths, meta.message)
+	end
+	return blocks, meta
 end
 
 --------------------------------------------------------------------------------
@@ -404,28 +492,160 @@ function Cli.exportLrPreview(photo)
 end
 
 --------------------------------------------------------------------------------
+-- Result building
+--------------------------------------------------------------------------------
+
+--- Turn a render (or batch block) kv table into a result table as returned
+-- by Cli.analyze. ctx: path, fileName, size (the --size used), ephemeral
+-- (files are unique per call and must be deleted by whoever shows them),
+-- sourceNote (pre-set reason, kept when the embedded preview was used),
+-- aspect (fallback when the CLI reports no source size).
+function Cli.resultFromKv(kv, ctx)
+	ctx = ctx or {}
+	kv = kv or {}
+	local result = {
+		info = kv,
+		path = ctx.path or kv.file,
+		fileName = ctx.fileName or Core.leafName(ctx.path or kv.file),
+		size = ctx.size,
+		ephemeral = ctx.ephemeral and true or false,
+		cached = kv.cached == 'true',
+		aspect = ctx.aspect,
+	}
+	if kv._nocli then
+		result.kind = 'nocli'
+		result.message = kv.message
+		return result
+	end
+
+	result.overview = kv.overview
+	result.crop = kv.crop
+	if result.overview and LrFileUtils.exists(result.overview) ~= 'file' then
+		result.overview = nil
+	end
+	if result.crop and LrFileUtils.exists(result.crop) ~= 'file' then
+		result.crop = nil
+	end
+	-- Pick the viewer's landscape/portrait slot from the overview actually
+	-- drawn (display orientation).
+	local sw, sh = Core.num(kv.source_width), Core.num(kv.source_height)
+	if sw and sh and sw > 0 and sh > 0 then
+		result.aspect = sw / sh
+	end
+	if kv.source == 'provided' then
+		result.sourceNote = 'Lightroom preview'
+	elseif kv.source == 'embedded_preview' then
+		result.sourceNote = ctx.sourceNote or 'embedded preview'
+	elseif kv.source == 'image' then
+		result.sourceNote = 'image file'
+	end
+
+	if kv.status == 'ok' then
+		result.kind = 'ok'
+	elseif kv.status == 'no_focus' then
+		result.kind = 'no_focus'
+		result.message = kv.message or 'The camera recorded no focus point for this photo.'
+	elseif kv.status == 'unsupported' then
+		result.kind = 'unsupported'
+		result.message = kv.message or 'No focus information: this file is not a supported Sony ARW/JPEG/HEIF.'
+	else
+		result.kind = 'error'
+		result.message = kv.message or 'The focuspoint helper reported an error.'
+	end
+	return result
+end
+
+--- Image files of a result (overview, crop) that exist on disk.
+function Cli.resultFiles(result)
+	local files = {}
+	if result and result.overview then
+		files[#files + 1] = result.overview
+	end
+	if result and result.crop then
+		files[#files + 1] = result.crop
+	end
+	return files
+end
+
+--- Is a stored (cache) result still showable? Its image files must exist –
+-- the CLI's LRU prune may have removed them.
+function Cli.resultFilesExist(result)
+	if type(result) ~= 'table' then
+		return false
+	end
+	if result.overview and LrFileUtils.exists(result.overview) ~= 'file' then
+		return false
+	end
+	if result.crop and LrFileUtils.exists(result.crop) ~= 'file' then
+		return false
+	end
+	return true
+end
+
+--- Can this result be kept in an in-memory cache (and shown again later)?
+-- Only CLI-cache-backed outcomes that depend on the file alone.
+function Cli.isCacheable(result)
+	if type(result) ~= 'table' or result.ephemeral then
+		return false
+	end
+	local k = result.kind
+	if k == 'unsupported' then
+		return true
+	end
+	return (k == 'ok' or k == 'no_focus') and result.overview ~= nil
+end
+
+--------------------------------------------------------------------------------
 -- Full pipeline
 --------------------------------------------------------------------------------
 
+local function guessAspect(photo)
+	local ok, a = LrTasks.pcall(function()
+		return photo:getRawMetadata('aspectRatio')
+	end)
+	return ok and tonumber(a) or nil
+end
+
 --- Analyse a photo and (optionally) render images.
 -- opts:
---   render       (bool)  run `render` (otherwise `info` only)
---   useLrPreview (bool)  try a Lightroom preview as --source
+--   render       (bool)  render images (otherwise `info` only)
+--   cacheDir     (string) use the CLI render cache (one `render` call, no
+--                `info`) unless a Lightroom preview is used
+--   useLrPreview (bool)  try a Lightroom preview as --source (HEIF files
+--                always do: the CLI can't decode HEVC)
 --   boxW, boxH   (number) overview box; --size is chosen so the image fits
+--   size         (number, optional) --size to try first (cache mode)
 --   cropSize     (number)
 --   isCancelled  (function, optional) return true to abandon early
+--                (only consulted on the Lightroom-preview path)
 -- Returns a result table:
 --   kind     'ok' | 'no_focus' | 'unsupported' | 'error' | 'video' |
 --            'missing' | 'nocli' | 'none' | 'cancelled'
 --   message  user-facing text for anything but 'ok'
 --   info     parsed CLI output (render output when rendering)
 --   overview, crop  image paths (render only, may be nil)
---   fileName, path
---   sourceNote  short note about which image source was used
+--   fileName, path, aspect, size
+--   ephemeral  true when overview/crop are unique files the caller deletes
+--              (false: they live in the render cache – never delete them)
+--   cached     the CLI served the render from its cache
+--   sourceNote short note about which image source was used
+--   timing     { total, exec, preview, calls } (seconds / count)
 function Cli.analyze(photo, opts)
 	opts = opts or {}
+	local started = LrDate.currentTime()
+	local timing = { exec = 0, preview = 0, calls = 0 }
 	local cancelled = opts.isCancelled or function()
 		return false
+	end
+	local function finish(r)
+		timing.total = LrDate.currentTime() - started
+		r.timing = timing
+		return r
+	end
+	local function run(kv)
+		timing.calls = timing.calls + 1
+		timing.exec = timing.exec + (kv._elapsed or 0)
+		return kv
 	end
 
 	local check = Cli.checkPhoto(photo)
@@ -433,59 +653,93 @@ function Cli.analyze(photo, opts)
 	if not check.ok then
 		result.kind = check.kind
 		result.message = check.message
-		return result
+		return finish(result)
 	end
 
 	local okBin, binMsg = Cli.checkBinary()
 	if not okBin then
 		result.kind = 'nocli'
 		result.message = binMsg
-		return result
+		return finish(result)
 	end
 
-	-- 1. Metadata only (fast): tells us whether there is anything to draw and
-	--    the displayed aspect, which we need to validate the Lr preview and to
-	--    choose --size.
-	local info = Cli.info(check.path)
+	local boxW = opts.boxW or 640
+	local boxH = opts.boxH or 480
+	local cropSize = opts.cropSize or 400
+	local heif = Core.isHeifPath(check.path)
+	local ctx = { path = check.path, fileName = check.fileName }
+
+	-- A. Fast path: one cached `render` call (no `info`, no Lr preview).
+	if opts.render and opts.cacheDir and not opts.useLrPreview and not heif then
+		local size = opts.size or Core.guessOverviewSize(guessAspect(photo), boxW, boxH)
+		ctx.size = size
+		local kv = run(Cli.render(check.path, { cacheDir = opts.cacheDir, size = size, cropSize = cropSize }))
+		local r = Cli.resultFromKv(kv, ctx)
+		-- The size was a guess (Lightroom's aspect can differ from the
+		-- camera's, e.g. rotated in Lightroom): render again at the size that
+		-- fills the box once the real aspect is known. Only once.
+		local preferred = r.overview and r.aspect and Core.preferredOverviewSize(r.aspect, boxW, boxH)
+		if preferred and preferred ~= size then
+			log:infof('%s: overview size %d -> %d (aspect %.4f)', tostring(check.fileName), size, preferred, r.aspect)
+			local ctx2 = { path = check.path, fileName = check.fileName, size = preferred }
+			local r2 = Cli.resultFromKv(run(Cli.render(check.path, {
+				cacheDir = opts.cacheDir, size = preferred, cropSize = cropSize,
+			})), ctx2)
+			if r2.kind ~= 'error' and r2.kind ~= 'nocli' then
+				r = r2
+			end
+		end
+		if not (r.kind == 'error' and kv.file_type == 'heif') then
+			return finish(r)
+		end
+		-- A HEIF file without a HEIF extension: needs a Lightroom preview.
+		heif = true
+	end
+
+	-- B. Metadata first (needed to validate a Lightroom preview and to
+	--    choose --size), then render, optionally on a Lightroom preview.
+	local info = run(Cli.info(check.path))
 	result.info = info
 	if info._nocli then
 		result.kind = 'nocli'
 		result.message = info.message
-		return result
+		return finish(result)
 	end
 	if info.status == 'unsupported' then
 		result.kind = 'unsupported'
 		result.message = info.message
 			or 'No focus information: this file is not a supported Sony ARW/JPEG/HEIF.'
-		return result
+		return finish(result)
 	end
 	if info.status == 'error' then
 		result.kind = 'error'
 		result.message = info.message or 'The focuspoint helper reported an error.'
-		return result
+		return finish(result)
 	end
 	if not opts.render then
 		result.kind = info.status == 'ok' and 'ok' or 'no_focus'
 		if result.kind == 'no_focus' then
 			result.message = info.message or 'The camera recorded no focus point for this photo.'
 		end
-		return result
+		return finish(result)
 	end
 	if cancelled() then
 		result.kind = 'cancelled'
-		return result
+		return finish(result)
 	end
 
-	-- 2. Optional Lightroom preview as the image source.
 	local aspect = Core.displayedAspect(info)
 	local sourcePath
-	if opts.useLrPreview then
+	local sourceNote
+	if opts.useLrPreview or heif then
 		local usable, why = Cli.previewUsable(photo)
 		if usable then
+			local t0 = LrDate.currentTime()
 			local p, pw, ph = Cli.exportLrPreview(photo)
+			timing.preview = LrDate.currentTime() - t0
 			if not p then
 				log:infof('%s: not using Lr preview (%s)', tostring(check.fileName), tostring(pw))
-				result.sourceNote = 'embedded preview'
+				sourceNote = 'embedded preview'
 			elseif aspect and not (pw and ph and Core.aspectMatches(pw / ph, aspect)) then
 				-- Most likely the user rotated the photo in Lightroom (the
 				-- focus coordinates are in camera orientation), or the preview
@@ -493,7 +747,7 @@ function Cli.analyze(photo, opts)
 				log:infof('%s: Lr preview %sx%s does not match camera aspect %.4f; using embedded preview',
 					tostring(check.fileName), tostring(pw), tostring(ph), aspect)
 				Cli.deleteFile(p)
-				result.sourceNote = 'embedded preview (Lightroom preview is rotated or reshaped)'
+				sourceNote = 'embedded preview (Lightroom preview is rotated or reshaped)'
 			else
 				sourcePath = p
 				if not aspect and pw and ph then
@@ -502,90 +756,110 @@ function Cli.analyze(photo, opts)
 			end
 		else
 			log:infof('%s: not using Lr preview (%s)', tostring(check.fileName), tostring(why))
-			result.sourceNote = 'embedded preview (' .. tostring(why) .. ')'
+			sourceNote = 'embedded preview (' .. tostring(why) .. ')'
 		end
 	end
 	if cancelled() then
 		Cli.deleteFile(sourcePath)
 		result.kind = 'cancelled'
-		return result
+		return finish(result)
 	end
 
 	if not aspect then
 		-- Last resort for choosing --size: Lightroom's own aspect ratio.
-		aspect = tonumber(photo:getRawMetadata('aspectRatio'))
+		aspect = guessAspect(photo)
 	end
-	-- The viewer uses this to pick the landscape or portrait picture slot.
-	result.aspect = aspect
 
-	-- 3. Render.
-	local boxW = opts.boxW or 640
-	local boxH = opts.boxH or 480
-	local rendered = Cli.render(check.path, {
-		outDir = Cli.renderDir(),
+	local size = Core.fitLongEdge(aspect, boxW, boxH)
+	ctx.size = size
+	ctx.aspect = aspect
+	ctx.sourceNote = sourceNote
+	ctx.ephemeral = sourcePath ~= nil or not opts.cacheDir
+	local rendered = run(Cli.render(check.path, {
+		cacheDir = opts.cacheDir,
 		source = sourcePath,
-		size = Core.fitLongEdge(aspect, boxW, boxH),
-		cropSize = opts.cropSize or 400,
-	})
+		size = size,
+		cropSize = cropSize,
+	}))
 	Cli.deleteFile(sourcePath)
 
-	result.info = rendered
-	if rendered._nocli then
-		result.kind = 'nocli'
-		result.message = rendered.message
-		return result
-	end
-	if rendered.status == 'error' and sourcePath then
+	if rendered.status == 'error' and sourcePath and not rendered._nocli then
 		-- Try once more without the Lightroom preview.
 		log:warnf('%s: render with Lr preview failed (%s); retrying with embedded preview',
 			tostring(check.fileName), tostring(rendered.message))
 		local retryAspect = Core.displayedAspect(info) or aspect
-		result.aspect = retryAspect
-		rendered = Cli.render(check.path, {
-			outDir = Cli.renderDir(),
-			size = Core.fitLongEdge(retryAspect, boxW, boxH),
-			cropSize = opts.cropSize or 400,
-		})
-		result.info = rendered
-		result.sourceNote = 'embedded preview'
+		ctx.aspect = retryAspect
+		ctx.size = Core.fitLongEdge(retryAspect, boxW, boxH)
+		ctx.ephemeral = not opts.cacheDir
+		ctx.sourceNote = 'embedded preview'
+		rendered = run(Cli.render(check.path, {
+			cacheDir = opts.cacheDir,
+			size = ctx.size,
+			cropSize = cropSize,
+		}))
 	end
 
-	result.overview = rendered.overview
-	result.crop = rendered.crop
-	if rendered.overview and LrFileUtils.exists(rendered.overview) ~= 'file' then
-		result.overview = nil
-	end
-	if rendered.crop and LrFileUtils.exists(rendered.crop) ~= 'file' then
-		result.crop = nil
-	end
-	-- Pick the viewer's landscape/portrait slot from the overview actually
-	-- drawn (display orientation). Without focus data `aspect` above is only a
-	-- guess (Lr preview or Lightroom's own, possibly rotated/cropped, aspect).
-	local sw, sh = Core.num(rendered.source_width), Core.num(rendered.source_height)
-	if sw and sh and sw > 0 and sh > 0 then
-		result.aspect = sw / sh
-	end
-	if rendered.source == 'provided' then
-		result.sourceNote = 'Lightroom preview'
-	elseif rendered.source == 'embedded_preview' then
-		result.sourceNote = result.sourceNote or 'embedded preview'
-	elseif rendered.source == 'image' then
-		result.sourceNote = 'image file'
-	end
+	return finish(Cli.resultFromKv(rendered, ctx))
+end
 
-	if rendered.status == 'ok' then
-		result.kind = 'ok'
-	elseif rendered.status == 'no_focus' then
-		result.kind = 'no_focus'
-		result.message = rendered.message or 'The camera recorded no focus point for this photo.'
-	elseif rendered.status == 'unsupported' then
-		result.kind = 'unsupported'
-		result.message = rendered.message or 'No focus information for this file type.'
-	else
-		result.kind = 'error'
-		result.message = rendered.message or 'The focuspoint helper reported an error.'
+--- Analyse many photos with as few CLI calls as possible (Read Focus
+-- Metadata): `focuspoint batch` through the render cache, grouped by the
+-- overview size the floating viewer would use, so it also warms the cache
+-- for the viewer. HEIF files, and any group the batch call fails for (e.g.
+-- an older helper without `batch`), fall back to one `info` call per photo.
+-- opts: cacheDir, boxW, boxH, cropSize.
+-- Returns an array of result tables (see Cli.analyze) aligned with `photos`.
+function Cli.analyzeBatch(photos, opts)
+	local results = {}
+	local groups, sizes = {}, {}
+	for i, photo in ipairs(photos) do
+		local check = Cli.checkPhoto(photo)
+		if not check.ok then
+			results[i] = { kind = check.kind, message = check.message, fileName = check.fileName, path = check.path }
+		elseif Core.isHeifPath(check.path) or string.find(check.path, '[\r\n]') then
+			results[i] = Cli.analyze(photo, { render = false })
+		else
+			local size = Core.guessOverviewSize(guessAspect(photo), opts.boxW or 640, opts.boxH or 480)
+			local g = groups[size]
+			if not g then
+				g = {}
+				groups[size] = g
+				sizes[#sizes + 1] = size
+			end
+			g[#g + 1] = { index = i, photo = photo, path = check.path, fileName = check.fileName }
+		end
 	end
-	return result
+	table.sort(sizes)
+	for _, size in ipairs(sizes) do
+		local g = groups[size]
+		local paths, seen = {}, {}
+		for _, e in ipairs(g) do
+			if not seen[e.path] then
+				seen[e.path] = true
+				paths[#paths + 1] = e.path
+			end
+		end
+		local blocks, meta = Cli.batch(paths, { cacheDir = opts.cacheDir, size = size, cropSize = opts.cropSize })
+		log:infof('timing: batch purpose=metadata n=%d size=%d blocks=%d exec_ms=%d',
+			#paths, size, #blocks, Core.ms(meta.elapsed))
+		local byFile = {}
+		for _, b in ipairs(blocks) do
+			byFile[b.file] = b
+		end
+		for _, e in ipairs(g) do
+			local b = byFile[e.path]
+			-- A per-file render error may still have readable metadata:
+			-- those fall back to `info` below.
+			if b and b.status ~= 'error' then
+				results[e.index] = Cli.resultFromKv(b, { path = e.path, fileName = e.fileName, size = size })
+			elseif meta.nocli then
+				results[e.index] = { kind = 'nocli', message = meta.message, fileName = e.fileName, path = e.path }
+			else
+				results[e.index] = Cli.analyze(e.photo, { render = false })
+			end
+		end
+	end
+	return results
 end
 
 return Cli
