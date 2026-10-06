@@ -142,7 +142,7 @@ function Viewer.applyResult(props, result, flagText)
 		status = result.message
 	end
 	if result.sourceNote then
-		status = status .. (status ~= '' and Core.SEPARATOR or '') .. 'source: ' .. result.sourceNote
+		status = status .. (status ~= '' and Core.SEPARATOR or '') .. 'overview: ' .. result.sourceNote
 	end
 	props.status = status
 	props.flagText = flagText or ''
@@ -309,10 +309,11 @@ function Viewer.buildContents(f, props, opts)
 	}
 	if opts.showPreviewToggle then
 		bottom[#bottom + 1] = f:checkbox {
-			title = 'Use Lightroom preview (sharper)',
+			title = 'Use Lightroom preview for overview (shows your edits)',
 			value = bind 'useLrPreview',
-			tooltip = 'Use Lightroom\'s own preview as the image (only for uncropped, '
-				.. 'unrotated photos). Off: use the JPEG embedded in the raw file.',
+			tooltip = 'Draw the overview on Lightroom\'s own preview (only for uncropped, '
+				.. 'unrotated photos). Off: use the JPEG embedded in the raw file. The zoomed '
+				.. 'crop always comes from the highest-resolution image available.',
 		}
 	end
 	if opts.onRefresh then
@@ -373,6 +374,11 @@ local function runViewer(context)
 		shownFiles = {}, -- image files currently displayed
 		lastFlagCheck = 0,
 	}
+	-- Stop the polling loop even if presentFloatingDialog never returns
+	-- normally (e.g. it throws), so it can't outlive the window/context.
+	context:addCleanupHandler(function()
+		s.closed = true
+	end)
 
 	local function setProp(key, value)
 		if not s.closed then

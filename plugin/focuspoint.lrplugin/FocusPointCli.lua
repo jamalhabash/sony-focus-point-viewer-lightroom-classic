@@ -558,6 +558,13 @@ function Cli.analyze(photo, opts)
 	if rendered.crop and LrFileUtils.exists(rendered.crop) ~= 'file' then
 		result.crop = nil
 	end
+	-- Pick the viewer's landscape/portrait slot from the overview actually
+	-- drawn (display orientation). Without focus data `aspect` above is only a
+	-- guess (Lr preview or Lightroom's own, possibly rotated/cropped, aspect).
+	local sw, sh = Core.num(rendered.source_width), Core.num(rendered.source_height)
+	if sw and sh and sw > 0 and sh > 0 then
+		result.aspect = sw / sh
+	end
 	if rendered.source == 'provided' then
 		result.sourceNote = 'Lightroom preview'
 	elseif rendered.source == 'embedded_preview' then

@@ -85,6 +85,13 @@ local stubs = {
 	LrLogger = function()
 		return logger
 	end,
+	-- Only needed so FocusPointViewer can be loaded (applyResult tests).
+	LrApplication = {},
+	LrBinding = {},
+	LrDialogs = {},
+	LrFunctionContext = {},
+	LrPrefs = {},
+	LrView = {},
 	LrDate = {
 		currentTime = function()
 			return os.time() - 978307200
@@ -146,6 +153,7 @@ end
 
 local Core = require 'FocusPointCore'
 local Cli = require 'FocusPointCli'
+local Viewer = require 'FocusPointViewer'
 
 -- Fake photo --------------------------------------------------------------------
 local function be16(n)
@@ -171,7 +179,7 @@ local function makePhoto(opts)
 			fileFormat = opts.fileFormat or 'RAW',
 			isVideo = opts.fileFormat == 'VIDEO',
 			isCropped = opts.isCropped or false,
-			aspectRatio = 1.5,
+			aspectRatio = opts.aspectRatio or 1.5,
 			pickStatus = 0,
 		}
 		return raw[key]
@@ -223,6 +231,7 @@ if not realBin then
 	installFakeCli(OK_INFO)
 	local photo = makePhoto({ thumb = fakeJpeg(2560, 1707) })
 	local r = Cli.analyze(photo, { render = true, useLrPreview = true, boxW = 640, boxH = 480, cropSize = 400 })
+	local happy = r
 	eq(r.kind, 'ok', 'happy: kind')
 	eq(r.sourceNote, 'Lightroom preview', 'happy: source note')
 	eq(exists(r.overview), 'file', 'happy: overview exists')
@@ -282,14 +291,41 @@ if not realBin then
 	local _, calls = string.gsub(slurp(argsLog) or '', '\n', '')
 	eq(calls, 1, 'unsupported: only info was run')
 
-	-- 9. no_focus is still rendered.
+	-- 9. no_focus is still rendered: overview only, no crop, no focus keys.
+	-- The photo is rotated to portrait in Lightroom, but the overview is the
+	-- camera's landscape frame: the slot must follow the overview.
 	installFakeCli([[
-if [ "$1" = info ]; then printf 'status=no_focus\nfocus_mode=MF\n'; exit 0; fi
-printf 'status=no_focus\nfocus_mode=MF\nmessage=Manual focus\n'
+if [ "$1" = info ]; then printf 'status=no_focus\nfocus_mode=Manual\nmessage=Manual focus\n'; exit 0; fi
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in --out-dir) out="$2"; shift;; esac
+  shift
+done
+mkdir -p "$out"
+: > "$out/ov-nf-$$.jpg"
+printf 'status=no_focus\nfocus_mode=Manual\nmessage=Manual focus\noverview=%s\nsource=embedded_preview\nsource_width=1616\nsource_height=1080\n' "$out/ov-nf-$$.jpg"
 ]])
-	r = Cli.analyze(makePhoto({}), { render = true })
+	r = Cli.analyze(makePhoto({ aspectRatio = 2 / 3 }), { render = true, useLrPreview = false })
 	eq(r.kind, 'no_focus', 'no_focus: kind')
 	eq(r.message, 'Manual focus', 'no_focus: message')
+	eq(exists(r.overview), 'file', 'no_focus: overview exists')
+	eq(r.crop, nil, 'no_focus: no crop')
+	eq(r.aspect, 1616 / 1080, 'no_focus: aspect from the rendered overview')
+
+	-- The viewer must not keep showing the previous photo's crop.
+	local props = {}
+	Viewer.initProps(props)
+	Viewer.applyResult(props, happy, 'Flag: Unflagged')
+	eq(props.cropPath, happy.crop, 'viewer: ok shows crop')
+	eq(props.showCrop, true, 'viewer: ok crop visible')
+	Viewer.applyResult(props, r, 'Flag: Unflagged')
+	eq(props.cropPath, Viewer.blankImage(), 'viewer: no_focus clears crop')
+	eq(props.showCrop, false, 'viewer: no_focus hides crop')
+	eq(props.landscapePath, r.overview, 'viewer: no_focus overview in landscape slot')
+	eq(props.showPortrait, false, 'viewer: no_focus portrait slot hidden')
+	eq(props.showMessage, false, 'viewer: no_focus overview shown, not the message overlay')
+	eq(string.find(props.status, 'Manual focus', 1, true) ~= nil, true, 'viewer: no_focus message in status')
+	eq(props.summary, 'Manual \194\183 DSC0001.ARW', 'viewer: no_focus summary')
 
 	-- 10. CLI error with exit 1 still parsed.
 	installFakeCli("printf 'status=error\\nmessage=corrupt file\\n'; exit 1\n")

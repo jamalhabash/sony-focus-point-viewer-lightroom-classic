@@ -5,7 +5,7 @@ Pure helper functions shared by the Focus Point plug-in.
 
 This module deliberately does NOT import any Lightroom namespace, so it can be
 loaded and unit-tested with a stock Lua 5.1 interpreter outside Lightroom
-(see plugin/tests/test_core.lua). Everything that touches the SDK lives in
+(see plugin/tests/test_kv.lua). Everything that touches the SDK lives in
 FocusPointCli.lua / FocusPointViewer.lua.
 
 Lua 5.1 only: no goto, no // operator, no utf8 library, no bit ops.
@@ -17,7 +17,8 @@ local Core = {}
 -- kv output parsing
 --
 -- The CLI prints one `key=value` per line (UTF-8). Inside values a newline is
--- written as the two characters `\n` and a backslash as `\\`. Any other
+-- written as the two characters `\n` and a backslash as `\\` (the CLI also
+-- writes a carriage return as `\r`). Any other
 -- backslash sequence is left untouched (we do not invent escapes the CLI does
 -- not produce).
 --------------------------------------------------------------------------------
@@ -25,6 +26,8 @@ local Core = {}
 local function unescapeChar(c)
 	if c == 'n' then
 		return '\n'
+	elseif c == 'r' then
+		return '\r'
 	elseif c == '\\' then
 		return '\\'
 	end

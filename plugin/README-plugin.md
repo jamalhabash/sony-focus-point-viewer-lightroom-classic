@@ -38,11 +38,14 @@ All commands are under **Library › Plug-in Extras** and also under
     current flag,
   * **Pick**, **Reject** and **Unflag** buttons. They act on the photo shown
     in the window, then show its new flag.
-  * **Use Lightroom preview** (on by default, remembered): for uncropped
-    photos the overview comes from Lightroom's own preview, so it has your
-    edits. Cropped, straightened or transformed photos, and photos rotated in
-    Lightroom, always use the JPEG embedded in the raw file, because the focus
-    coordinates refer to the camera's full frame. **Re-render** redraws the
+  * **Use Lightroom preview for overview (shows your edits)** (on by
+    default, remembered): for uncropped photos the overview comes from
+    Lightroom's own preview, so it has your edits. The zoomed crop always
+    comes from the highest-resolution image available (for raw files the
+    full-size JPEG embedded in the file), whatever this setting. Cropped,
+    straightened or transformed photos, and photos rotated in Lightroom,
+    always use the JPEG embedded in the raw file for the overview, because
+    the focus coordinates refer to the camera's full frame. **Re-render** redraws the
     current photo, for example after you change its crop.
 
   If you hold an arrow key, the viewer waits until you stop and then renders
@@ -94,8 +97,8 @@ error.
     `~/Library/Logs/Adobe/Lightroom/LrClassicLogs/focuspoint.log`
     (Windows: `%LOCALAPPDATA%\Adobe\Lightroom\Logs\LrClassicLogs\`)
   * earlier versions: `~/Documents/LrClassicLogs/focuspoint.log`
-* **The box is in the wrong place:** turn off *Use Lightroom preview* and
-  click *Re-render*. If the box is then correct, the Lightroom preview didn't
+* **The box is in the wrong place:** turn off *Use Lightroom preview for
+  overview* and click *Re-render*. If the box is then correct, the Lightroom preview didn't
   match the camera frame. This can happen with photos rotated 180° in
   Lightroom, or with strong lens-distortion corrections. Please report it with
   the log lines for that photo.

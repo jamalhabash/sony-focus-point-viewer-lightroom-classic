@@ -44,6 +44,7 @@ eq(Core.unescapeValue('a\\\\\\nb'), 'a\\\nb', 'backslash then newline')
 eq(Core.unescapeValue('C:\\\\Users\\\\x'), 'C:\\Users\\x', 'windows path')
 eq(Core.unescapeValue('trail\\'), 'trail\\', 'lone trailing backslash kept')
 eq(Core.unescapeValue('a\\tb'), 'a\\tb', 'unknown escape kept verbatim')
+eq(Core.unescapeValue('a\\rb'), 'a\rb', 'unescape \\r -> CR (the CLI escapes CR too)')
 eq(Core.unescapeValue(''), '', 'unescape empty')
 
 -- escape/unescape round trip
