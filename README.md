@@ -1,3 +1,48 @@
+# Focus Point
+
+A Lightroom Classic plug-in that shows where your Sony a7 IV focused, so you
+can judge focus while culling.
+
+Sony writes the focus location, focus-frame size, focus mode and AF area mode
+into the maker note of every ARW/JPEG/HEIF. The plug-in reads those fields,
+draws the focus box on the photo, and shows a 1:1 crop around it. a7 IV raw
+files (firmware 2+) embed a full-resolution JPEG, so the crop shows real
+pixel-level sharpness with no raw decoding.
+
+```
+lr-focus-point/
+├── flake.nix                     dev shell, CLI + plug-in packages, install app
+├── src/                          Rust CLI `focuspoint` (TIFF/JPEG/HEIF + Sony maker note parser, renderer)
+├── plugin/focuspoint.lrplugin/   Lua plug-in (calls the CLI)
+├── plugin/tests/                 standalone Lua 5.1 tests
+├── scripts/fetch-testdata.sh     downloads public a7 IV samples into testdata/
+└── SPEC.md                       CLI contract between the two halves
+```
+
+## Quick start
+
+```sh
+nix run .#install          # build + copy into Lightroom's Modules folder
+```
+
+Restart Lightroom Classic, then **Library › Plug-in Extras › Focus Point Viewer…**.
+
+## Development
+
+```sh
+nix develop                          # cargo, clippy, exiftool, lua5.1
+cargo test                           # unit + CLI tests (no sample files needed)
+scripts/fetch-testdata.sh            # optional: real a7 IV samples
+cargo test -- --include-ignored      # + tests against testdata/
+cargo run -- info testdata/…/DSC06677.ARW --format kv
+cargo run -- render photo.ARW --out-dir /tmp/fp
+(cd plugin/tests && lua test_kv.lua && lua test_cli_stubbed.lua)
+nix build                            # CLI only
+nix build .#plugin                   # result/focuspoint.lrplugin with bin/focuspoint
+```
+
+Nix flakes only see git-tracked files, so `git add` new files before `nix build`.
+
 ## Lightroom plug-in
 
 ### Install
@@ -13,7 +58,7 @@ Lightroom Classic loads everything in that `Modules` folder automatically when
 it starts, so just restart Lightroom (or use **File › Plug-in Manager… › Reload
 Plug-in** if it is already listed).
 
-Alternatively build it with `nix build` and add `result/focuspoint.lrplugin`
+Alternatively build it with `nix build .#plugin` and add `result/focuspoint.lrplugin`
 in **File › Plug-in Manager… › Add**. The Nix store copy is read-only, which
 is fine for running it; copy it somewhere writable if you prefer.
 
