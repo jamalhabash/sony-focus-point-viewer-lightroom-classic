@@ -15,7 +15,8 @@ lr-focus-point/
 └── SPEC.md
 ```
 
-`nix build` produces `result/focuspoint.lrplugin/` = Lua sources + `bin/focuspoint`.
+`nix build .#plugin` produces `result/focuspoint.lrplugin/` = Lua sources + `bin/focuspoint`
+(plain `nix build` builds just the CLI into `result/bin/focuspoint`).
 `nix run .#install` copies that bundle (not a symlink — real files, chmod u+w) to
 `~/Library/Application Support/Adobe/Lightroom/Modules/focuspoint.lrplugin`,
 which Lightroom Classic auto-loads on start.
@@ -43,11 +44,17 @@ focuspoint render <FILE> --out-dir <DIR> [--source <JPEG>] [--size <PX>] [--crop
     800) px, cut from the highest-resolution source available at the largest
     scale it supports (never upscale beyond 1:1 of the source), with the focus
     box drawn too.
-  * Image source priority: `--source <JPEG>` if given (assumed to be the full,
-    uncropped frame already in *display* orientation — e.g. a Lightroom preview);
-    otherwise the largest embedded JPEG in the ARW (PreviewImage / JpgFromRaw),
-    or the JPEG file itself. Embedded previews are in *sensor* orientation, so
-    apply EXIF Orientation before drawing/saving.
+  * Image sources (`--source <JPEG>` is assumed to be the full, uncropped
+    frame already in *display* orientation — e.g. a Lightroom preview;
+    embedded previews / camera JPEGs are in *sensor* orientation, so EXIF
+    Orientation is applied to them before drawing/saving):
+    * overview: `--source` if given (and its aspect matches), otherwise the
+      smallest embedded JPEG whose long edge is >= `--size` (or the largest),
+      or the JPEG file itself.
+    * crop: always the highest-resolution image available — the larger (by
+      pixel count) of `--source` and the largest embedded JPEG in the ARW
+      (PreviewImage / JpgFromRaw; a7 IV v2 firmware embeds a full 7008x4672
+      JpgFromRaw) or the JPEG file itself; embedded/file wins a tie.
 * Output `--format kv` (what the Lua plugin uses): one `key=value` per line,
   UTF-8, values with `\n` / `\\` escaped as `\\n` / `\\\\`. Keys (omit when unknown):
 
@@ -62,16 +69,41 @@ focuspoint render <FILE> --out-dir <DIR> [--source <JPEG>] [--size <PX>] [--crop
   | `frame_width`, `frame_height` | focus frame box size in that space, when known |
   | `norm_x`, `norm_y` | focus point as 0..1 fractions of the **displayed** (orientation-applied) frame |
   | `norm_w`, `norm_h` | frame size as fractions of the displayed frame |
-  | `focus_mode` | e.g. `AF-C`, `AF-S`, `DMF`, `MF` |
-  | `af_area_mode` | e.g. `Wide`, `Zone`, `Flexible Spot: M`, `Tracking: Expand Flexible Spot` … |
+  | `focus_mode` | ExifTool strings: `AF-C`, `AF-S`, `AF-A`, `DMF`, `Manual` |
+  | `af_area_mode` | e.g. `Wide`, `Zone`, `Flexible Spot`, `Tracking: Wide`, `Human Eye Tracking: Zone` (see notes below) |
   | `af_tracking`, `face_eye` | any subject/face/eye detection info the camera records, if decodable |
   | `overview`, `crop` | absolute paths of written JPEGs (`render` only) |
-  | `source` | `provided`, `embedded_preview`, `image` (`render` only) |
-  | `source_width`, `source_height` | dimensions of the image the crop was taken from |
+  | `source` | image the **overview** was drawn from: `provided`, `embedded_preview`, `image` (`render` only) |
+  | `source_width`, `source_height` | dimensions of the overview source image |
+  | `crop_source` | image the **crop** was cut from: `provided`, `embedded_preview`, `image` (only when a crop is written) |
+  | `crop_source_width`, `crop_source_height` | dimensions of the crop source image |
 
   `--format json` (default): same data as a JSON object (for humans/debugging).
 * Exit code 0 for `ok` and `no_focus` and `unsupported`; 1 for `error`.
   Always print the kv/json block, even on error.
+* Implementation notes / clarifications (Rust CLI, additive only):
+  * `af_area_mode` = the area mode actually used (enciphered tag 0x9402, offset
+    0x17, ExifTool `AFAreaMode`) combined with the menu setting (0x201c,
+    ExifTool `AFAreaModeSetting`) as `"<used>: <setting>"` when they differ,
+    e.g. `Tracking: Wide`, `Human Eye Tracking: Zone`; otherwise just one
+    value, e.g. `Zone`, `Flexible Spot`.
+  * `face_eye`: `Face`, `Human Eye` or `Animal Eye` when the camera says so
+    (AFAreaMode 15/21/20, or AFTracking = Face tracking); omitted otherwise.
+  * `af_tracking`: ExifTool `AFTracking` (`Off`, `Face tracking`, `Lock On AF`).
+  * Extra keys that may appear: `file_type` (`tiff`/`jpeg`/`heif`),
+    `software`, `af_area_mode_setting`, `af_zone` (e.g. `Center Zone`),
+    `flexible_spot_position` (`"x y"`, ExifTool 640x480-ish grid), `warning`
+    (render: e.g. `--source` rejected because its aspect ratio does not match
+    the frame, in which case the embedded image is used instead).
+  * `no_focus` (stripped maker note, non-Sony, manual focus, FocusLocation
+    `0 0`): focus geometry keys are omitted; `render` still writes the
+    `overview` (no box) but no `crop`.
+  * `--source` whose aspect ratio differs from the expected displayed frame by
+    more than 3% is ignored (falls back to the embedded image, sets `warning`).
+  * HEIF: `info` works; `render` needs `--source` (no HEVC decoder), else `status=error`.
+  * Crop: native 1:1 pixels from the largest available image, never upscaled;
+    if that image is smaller than `--crop-size` in a dimension, the crop is
+    smaller too.
 
 ### Sony maker note facts (verify against ExifTool's `lib/Image/ExifTool/Sony.pm`)
 
@@ -79,7 +111,12 @@ focuspoint render <FILE> --out-dir <DIR> [--source <JPEG>] [--size <PX>] [--crop
   IFD, sometimes preceded by `"SONY DSC \0\0\0"` / `"SONY CAM \0\0\0"` (12 bytes);
   offsets are relative to the main TIFF header.
 * `0x2027 FocusLocation` int16u[4] = image width, height, focus x, focus y.
-* `0x204a FocusLocation2` (newer bodies, incl. a7 IV?) — check semantics.
+* `0x204a FocusLocation2` (ILCE-9M3 and newer; ExifTool: "same as FocusLocation
+  within one pixel"). Not written by the a7 IV (v2.00 samples); used only as a
+  fallback when 0x2027 is missing.
+* Verified on a7 IV: `0x2037` is stored as `undef[6]` and must be read as
+  int16u[3]; the focus-location space is the full output image size in sensor
+  orientation (7008x4672 FF, 4608x3072 APS-C), also for S/M-size RAWs.
 * `0x2037 FocusFrameSize` int16u[3] = width, height, valid flag.
 * `0x201b FocusMode`, `0x201c AFAreaModeSetting`, `0x201d FlexibleSpotPosition`,
   `0x2020 AFPointsUsed`, `0x2021 AFTracking`, plus enciphered `0x9400`/`0x940c`

@@ -1,0 +1,22 @@
+[package]
+name = "focuspoint"
+version = "0.1.0"
+edition = "2021"
+description = "Read and render the autofocus point of Sony a7 IV (ILCE-7M4) photos"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
+
+# Image decoding is painfully slow unoptimised; keep tests snappy.
+[profile.dev.package."*"]
+opt-level = 2

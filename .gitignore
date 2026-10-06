@@ -1,0 +1,9 @@
+/target/
+result
+result-*
+/testdata/
+*.ARW
+*.arw
+*.HIF
+*.hif
+.DS_Store
