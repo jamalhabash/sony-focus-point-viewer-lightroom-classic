@@ -205,3 +205,17 @@ error.
   or the window closes. Leftovers older than 10 minutes are removed the next
   time a window opens. You can delete the folder at any time while no Focus
   Point window is open.
+
+## Credits
+
+Sony maker-note tag meanings and value names follow
+[ExifTool](https://exiftool.org/) by Phil Harvey (`lib/Image/ExifTool/Sony.pm`),
+which is also used in the test suite to cross-check results.
+
+## License
+
+[0BSD](LICENSE). Binaries built from this repo statically include third-party
+crates under their own permissive licenses (MIT, Apache-2.0, BSD-3-Clause,
+Zlib, IJG, …). If you distribute a built plug-in, include their notices; for
+libjpeg-turbo that means stating that the software is based in part on the
+work of the Independent JPEG Group.

@@ -3,7 +3,7 @@ name = "focuspoint"
 version = "0.1.0"
 edition = "2021"
 description = "Read and render the autofocus point of Sony a7 IV (ILCE-7M4) photos"
-license = "MIT"
+license = "0BSD"
 publish = false
 
 [dependencies]
